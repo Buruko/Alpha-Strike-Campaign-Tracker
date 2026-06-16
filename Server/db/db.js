@@ -1,28 +1,41 @@
 /**
- * db.js
- * Single better-sqlite3 instance with schema auto-init on startup.
+ * db.js  —  D1 adapter
+ *
+ * Wraps Cloudflare D1's async API so routes use:
+ *   const db = getDb(env);
+ *   await db.get(sql, [params])
+ *   await db.all(sql, [params])
+ *   await db.run(sql, [params])
+ *   await db.transaction(async (db) => { ... })
  */
 
-const Database = require('better-sqlite3');
-const path     = require('path');
-const fs       = require('fs');
+export function getDb(env) {
+  const D1 = env.DB;
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, '../../data/campaign.db');
+  async function get(sql, params = []) {
+    const result = await D1.prepare(sql).bind(...params).first();
+    return result ?? null;
+  }
 
-// Ensure data directory exists
-const dataDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+  async function all(sql, params = []) {
+    const result = await D1.prepare(sql).bind(...params).all();
+    return result.results ?? [];
+  }
+
+  async function run(sql, params = []) {
+    return await D1.prepare(sql).bind(...params).run();
+  }
+
+  async function batch(statements) {
+    const prepared = statements.map(({ sql, params = [] }) =>
+      D1.prepare(sql).bind(...params)
+    );
+    return await D1.batch(prepared);
+  }
+
+  async function transaction(fn) {
+    return await fn({ get, all, run, batch });
+  }
+
+  return { get, all, run, batch, transaction };
 }
-
-const db = new Database(DB_PATH);
-
-// Apply schema
-const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
-db.exec(schema);
-
-// Enable WAL mode for better concurrent read performance
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-
-module.exports = db;

@@ -18,7 +18,7 @@
  * roundArmor/roundStructure etc. are per-round overlays — ignored on import.
  */
 
-const { countDamaged } = require('./repairCalculator');
+import { countDamaged } from './repairCalculator.js';
 
 /**
  * Map Jeff's unit type strings to our internal types.
@@ -176,7 +176,7 @@ function previewJeffExport(input) {
   return parseJeffExport(input, '__preview__');
 }
 
-module.exports = {
+export {
   parseJeffExport,
   previewJeffExport,
   parseMember,

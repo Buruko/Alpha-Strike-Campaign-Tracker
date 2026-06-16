@@ -1,52 +1,150 @@
-# Alpha Strike Campaign Tracker
+# Alpha Strike Campaign Tracker — Cloudflare Deployment
 
-A full-stack web application for tracking BattleTech Alpha Strike campaigns.
+Fully free hosting via **Cloudflare Workers** (API) + **Cloudflare Pages** (frontend) + **D1** (SQLite database).
 
-## Features
-
-- **Pilots** — XP tracking, auto rank-up with notification, PSA selection modal
-- **Units** — Clickable pip damage tracker + numeric display, repair cost breakdown
-- **Repair Queue** — Technician creates jobs, Quartermaster approves, auto accounting debit
-- **Unit Roster** — Quartermaster manages all units, pilot assignment, unit sales
-- **Play Mode** — GM imports Jeff's Battletech tool JSON, tracks enemy units, logs damage XP, assigns kill credit with disparity-adjusted XP
-- **Salvage** — Post-session review of destroyed/captured enemy units, claim to player roster
-- **Accounting** — Shared campaign ledger with automated transactions for purchases, sales, repairs, salvage
-- **Contracts & Sessions** — GM creates contracts and sessions with objectives and XP rewards
-- **Notifications** — In-app bell with rank-up alerts, repair complete, salvage available
-
-## Roles
-
-| Role | Access |
-|------|--------|
-| Player | Own pilots, own units (damage tracking), XP history |
-| Technician | + Create and complete repair jobs |
-| Quartermaster | + Unit roster, pilot assignment, unit sales, approve repairs, salvage, ledger |
-| GM | Full access — XP awards, play mode, contracts, admin, user management |
+No credit card required. No cold starts. Always-on.
 
 ---
 
-## Local Development
+## Free tier limits (more than enough for a campaign group)
 
-### 1. Server
+| Resource | Free Allowance |
+|---|---|
+| Workers requests | 100,000 / day |
+| D1 reads | 25 million rows / day |
+| D1 writes | 100,000 rows / day |
+| D1 storage | 5 GB |
+| Pages deployments | Unlimited |
+
+---
+
+## One-time setup (do this once)
+
+### 1. Install Wrangler
+
+```bash
+npm install -g wrangler
+wrangler login        # opens browser to authenticate with your Cloudflare account
+```
+
+### 2. Create the D1 database
 
 ```bash
 cd server
-cp .env.example .env
-# Edit .env — set JWT_SECRET to something long and random
-npm install
-npm run seed        # Creates DB, seeds PSAs, creates default GM user (gm/changeme)
-npm run dev         # Starts API on http://localhost:3001
+wrangler d1 create campaign-db
 ```
 
-### 2. Client
+Copy the `database_id` it prints and paste it into `wrangler.toml`:
+
+```toml
+[[d1_databases]]
+binding       = "DB"
+database_name = "campaign-db"
+database_id   = "PASTE_YOUR_ID_HERE"
+```
+
+### 3. Run migrations and seed
+
+```bash
+# Apply schema
+wrangler d1 migrations apply campaign-db --remote
+
+# Seed PSAs and default GM user (gm / changeme)
+wrangler d1 execute campaign-db --remote --file=./migrations/0002_seed.sql
+```
+
+### 4. Set the JWT secret
+
+```bash
+wrangler secret put JWT_SECRET
+# Enter a long random string when prompted, e.g.:
+# openssl rand -base64 48
+```
+
+### 5. Deploy the Worker (API)
+
+```bash
+wrangler deploy
+```
+
+Note the URL it prints, e.g. `https://alpha-strike-api.YOUR_SUBDOMAIN.workers.dev`
+
+### 6. Deploy the frontend to Cloudflare Pages
+
+```bash
+cd ../client
+npm install
+npm run build
+
+wrangler pages deploy dist --project-name alpha-strike-tracker
+```
+
+Note your Pages URL, e.g. `https://alpha-strike-tracker.pages.dev`
+
+### 7. Wire the URLs together
+
+**Set CLIENT_URL on the Worker** (so CORS allows your Pages domain):
+
+```bash
+cd ../server
+wrangler deploy --var CLIENT_URL:https://alpha-strike-tracker.pages.dev
+```
+
+Or add it to `wrangler.toml` permanently:
+
+```toml
+[vars]
+CLIENT_URL = "https://alpha-strike-tracker.pages.dev"
+```
+
+**Set VITE_API_URL on Pages** so the frontend knows where the API is:
+
+In the Cloudflare dashboard → Pages → your project → Settings → Environment variables:
+
+```
+VITE_API_URL = https://alpha-strike-api.YOUR_SUBDOMAIN.workers.dev
+```
+
+Then redeploy the frontend:
+
+```bash
+npm run build
+wrangler pages deploy dist --project-name alpha-strike-tracker
+```
+
+---
+
+## Local development
+
+### Terminal 1 — Worker (API)
+
+```bash
+cd server
+npm install
+
+# Apply schema to local D1
+wrangler d1 migrations apply campaign-db --local
+
+# Seed local DB
+wrangler d1 execute campaign-db --local --file=./migrations/0002_seed.sql
+
+# Start local Worker (listens on :8787)
+wrangler dev
+```
+
+### Terminal 2 — Frontend
 
 ```bash
 cd client
 npm install
-npm run dev         # Starts Vite dev server on http://localhost:5173
+npm run dev    # Vite proxies /api → localhost:8787
 ```
 
-### Default login
+Open `http://localhost:5173`
+
+---
+
+## Default login
 
 ```
 Username: gm
@@ -57,44 +155,43 @@ Password: changeme
 
 ---
 
-## Deploy to Render (Free Tier)
+## Adding more users
 
-1. Push this entire repo to GitHub.
-2. Log in to [render.com](https://render.com) and click **New → Blueprint**.
-3. Connect your GitHub repo — Render will detect `render.yaml` automatically.
-4. Deploy. Two services will be created:
-   - `alpha-strike-api` — Express backend (free web service, spins down after 15 min idle)
-   - `alpha-strike-tracker` — React frontend (free static site, always on)
-5. After deploy, update `CLIENT_URL` in the backend env to match your frontend URL.
-6. Open the frontend URL and log in as `gm` / `changeme`.
+Log in as GM → Admin → New User. Set role:
 
-> **Note:** The free backend tier sleeps after 15 minutes of inactivity. The first request after sleep takes ~30 seconds to wake up. Upgrade to a paid instance ($7/mo) to eliminate cold starts.
+| Role | What they can do |
+|---|---|
+| **Player** | Manage own pilots, track unit damage, view XP log |
+| **Technician** | + Create and complete repair jobs |
+| **Quartermaster** | + Unit roster, assign pilots, sell/purchase units, approve repairs, salvage, ledger |
+| **GM** | Full access — XP awards, play mode, contracts, admin |
 
 ---
 
-## Repair Cost Formula
+## Repair cost formulas (reference)
 
-- **Armor** cost per pip: `round(PV / 4 / armor_max)`
-- **Structure** cost per pip: `round(PV / 2 / armor_max)`
-- **Engine** cost per hit: `round(PV / 2)`
-- **FCU / MP / Weapons** cost per hit: `round(PV / 4)`
+| Damage type | Cost per pip |
+|---|---|
+| Armor | `round(PV / 4 / armor_max)` |
+| Structure | `round(PV / 2 / armor_max)` |
+| Engine hit | `round(PV / 2)` per hit |
+| FCU / MP / Weapons | `round(PV / 4)` per hit |
 
-## Sale Value Formula
+**Sale value** is calculated per pip type using a 7-step formula (Intact Value, Salvage Penalty, Weight Penalty per type), minimum 1 pt.
 
-Calculated per pip type, then summed:
+**Salvage value** = `max(1, base_pv - current_repair_cost)`
 
-1. Full repair cost (all pips damaged)
-2. Parts total = sum of all max pips
-3. Parts % = parts total / full repair cost
-4. Per type: Intact Value = pip cost × intact pips
-5. Per type: Salvage Penalty = Intact Value × Parts %
-6. Per type: Weight Penalty = Intact Value × (10% all types, 50% engine)
-7. Per type: Intact Result = Intact Value − (Salvage Penalty + Weight Penalty)
-8. Sale Value = max(1, sum(all Intact Results) × Parts %)
+---
 
-## XP System
+## Redeploying after changes
 
-- **TAC Damage**: 2 XP · **Critical/Melee**: 1 XP
-- **Kill XP**: Base value (by unit type/size) × disparity multiplier, rounded
-- **Rank progression**: Starting → Rank I (10 XP) → Rank II (25 XP + 1 PSA) → Rank III (40 XP + 2 PSA) → Rank IV (55 XP + 3 PSA)
-- Each rank improves pilot skill by 1 (lower = better)
+```bash
+# API changes
+cd server && wrangler deploy
+
+# Frontend changes
+cd client && npm run build && wrangler pages deploy dist --project-name alpha-strike-tracker
+
+# Schema changes — add a new migration file (0003_whatever.sql) then:
+wrangler d1 migrations apply campaign-db --remote
+```

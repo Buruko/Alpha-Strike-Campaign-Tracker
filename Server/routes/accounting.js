@@ -1,172 +1,90 @@
-/**
- * routes/accounting.js
- *
- * GET  /api/accounting/balance      — current campaign balance
- * GET  /api/accounting/ledger       — full ledger (QM/GM) or own transactions (player)
- * POST /api/accounting/deposit      — manual deposit (GM only)
- * POST /api/accounting/withdraw     — manual withdrawal (GM only)
- * POST /api/accounting/sell-unit    — sell unit, auto credit + accounting (QM/GM)
- */
+import { v4 as uuid } from 'uuid';
+import { getDb } from '../db/db.js';
+import { verifyAuth, requireMinRole } from '../middleware/auth.js';
+import { ok, err } from '../lib/response.js';
+import { calcSaleValue } from '../lib/repairCalculator.js';
 
-const router = require('express').Router();
-const { v4: uuid } = require('uuid');
-const db = require('../db/db');
-const { verifyAuth } = require('../middleware/auth');
-const { requireRole, requireMinRole } = require('../middleware/requireRole');
-const { calcSaleValue } = require('../lib/repairCalculator');
-
-router.use(verifyAuth);
-
-function getBalance() {
-  return db.prepare('SELECT balance FROM campaign_account WHERE id = 1').get()?.balance ?? 0;
+export async function postLedgerEntry(db, { type, amount, description, unitId, sessionId, repairJobId, salvageId, createdBy }) {
+  const acct   = await db.get('SELECT balance FROM campaign_account WHERE id=1');
+  const cur    = acct?.balance ?? 0;
+  const newBal = type.startsWith('withdraw') ? cur - amount : cur + amount;
+  await db.batch([
+    { sql: 'UPDATE campaign_account SET balance=? WHERE id=1', params: [newBal] },
+    { sql: 'INSERT INTO account_ledger (id,type,amount,balance_after,description,unit_id,session_id,repair_job_id,salvage_id,created_by) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      params: [uuid(), type, amount, newBal, description, unitId??null, sessionId??null, repairJobId??null, salvageId??null, createdBy] },
+  ]);
+  return newBal;
 }
 
-function postLedgerEntry({ type, amount, description, unitId, sessionId, repairJobId, salvageId, createdBy }) {
-  const isDebit = type.startsWith('withdraw');
-  const current = getBalance();
-  const newBalance = isDebit ? current - amount : current + amount;
+export function accountingRoutes(router) {
 
-  db.prepare('UPDATE campaign_account SET balance = ? WHERE id = 1').run(newBalance);
+  router.get('/api/accounting/balance', verifyAuth, async (request, env) => {
+    const db   = getDb(env);
+    const acct = await db.get('SELECT balance FROM campaign_account WHERE id=1');
+    return ok({ balance: acct?.balance ?? 0 });
+  });
 
-  db.prepare(`
-    INSERT INTO account_ledger
-      (id, type, amount, balance_after, description, unit_id, session_id, repair_job_id, salvage_id, created_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    uuid(), type, amount, newBalance, description,
-    unitId ?? null, sessionId ?? null, repairJobId ?? null, salvageId ?? null, createdBy
-  );
+  router.get('/api/accounting/ledger', requireMinRole('quartermaster'), async (request, env) => {
+    const db     = getDb(env);
+    const url    = new URL(request.url);
+    const limit  = parseInt(url.searchParams.get('limit')  ?? '100');
+    const offset = parseInt(url.searchParams.get('offset') ?? '0');
+    const type   = url.searchParams.get('type');
+    let q      = `SELECT al.*,u.username AS created_by_username,un.name AS unit_name FROM account_ledger al LEFT JOIN users u ON u.id=al.created_by LEFT JOIN units un ON un.id=al.unit_id`;
+    const params = [];
+    if (type) { q += ' WHERE al.type=?'; params.push(type); }
+    q += ' ORDER BY al.created_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+    const [entries, countRow, acct] = await Promise.all([
+      db.all(q, params),
+      db.get('SELECT COUNT(*) AS count FROM account_ledger'),
+      db.get('SELECT balance FROM campaign_account WHERE id=1'),
+    ]);
+    return ok({ entries, total: countRow?.count ?? 0, balance: acct?.balance ?? 0 });
+  });
 
-  return newBalance;
+  router.post('/api/accounting/deposit', requireMinRole('gm'), async (request, env) => {
+    const db   = getDb(env);
+    const { amount, description, session_id } = await request.json().catch(() => ({}));
+    if (!amount || amount <= 0) return err('amount must be positive', 400);
+    if (!description) return err('description required', 400);
+    const bal = await postLedgerEntry(db, { type:'deposit_manual', amount, description, sessionId:session_id??null, createdBy:request.user.id });
+    return ok({ ok:true, balance:bal });
+  });
+
+  router.post('/api/accounting/mission-payout', requireMinRole('gm'), async (request, env) => {
+    const db   = getDb(env);
+    const { amount, description, session_id } = await request.json().catch(() => ({}));
+    if (!amount || amount <= 0) return err('amount must be positive', 400);
+    const bal = await postLedgerEntry(db, { type:'deposit_mission', amount, description:description??'Mission payout', sessionId:session_id??null, createdBy:request.user.id });
+    return ok({ ok:true, balance:bal });
+  });
+
+  router.post('/api/accounting/withdraw', requireMinRole('gm'), async (request, env) => {
+    const db   = getDb(env);
+    const { amount, description } = await request.json().catch(() => ({}));
+    if (!amount || amount <= 0) return err('amount must be positive', 400);
+    if (!description) return err('description required', 400);
+    const acct = await db.get('SELECT balance FROM campaign_account WHERE id=1');
+    if ((acct?.balance ?? 0) < amount) return err(`Insufficient funds. Balance: ${acct?.balance ?? 0}`, 400);
+    const bal = await postLedgerEntry(db, { type:'withdraw_manual', amount, description, createdBy:request.user.id });
+    return ok({ ok:true, balance:bal });
+  });
+
+  router.post('/api/accounting/sell-unit', requireMinRole('quartermaster'), async (request, env) => {
+    const db   = getDb(env);
+    const { unit_id, override_price } = await request.json().catch(() => ({}));
+    if (!unit_id) return err('unit_id required', 400);
+    const unit = await db.get('SELECT * FROM units WHERE id=?', [unit_id]);
+    if (!unit) return err('Unit not found', 404);
+    if (unit.status === 'retired') return err('Unit is already retired', 400);
+    const { saleValue, breakdown } = calcSaleValue(unit);
+    const finalPrice = override_price != null ? parseInt(override_price) : saleValue;
+    await db.batch([
+      { sql: "UPDATE units SET status='retired' WHERE id=?", params: [unit_id] },
+      { sql: "UPDATE pilot_unit_assignments SET unassigned_at=datetime('now') WHERE unit_id=? AND unassigned_at IS NULL", params: [unit_id] },
+    ]);
+    const bal = await postLedgerEntry(db, { type:'deposit_sale', amount:finalPrice, description:`Sold unit: ${unit.name}`, unitId:unit_id, createdBy:request.user.id });
+    return ok({ ok:true, unit_id, calculated_sale_value:saleValue, final_price:finalPrice, balance:bal, breakdown });
+  });
 }
-
-// ── Balance ──────────────────────────────────────────────────────────────────
-router.get('/balance', (req, res) => {
-  res.json({ balance: getBalance() });
-});
-
-// ── Ledger ───────────────────────────────────────────────────────────────────
-router.get('/ledger', (req, res) => {
-  const { role, player_id } = req.user;
-  const { limit = 100, offset = 0, type } = req.query;
-
-  let query = `
-    SELECT al.*, u.username AS created_by_username,
-           un.name AS unit_name
-    FROM account_ledger al
-    LEFT JOIN users u ON u.id = al.created_by
-    LEFT JOIN units un ON un.id = al.unit_id
-  `;
-  const params = [];
-
-  if (type) {
-    query += ' WHERE al.type = ?';
-    params.push(type);
-  }
-
-  query += ' ORDER BY al.created_at DESC LIMIT ? OFFSET ?';
-  params.push(parseInt(limit), parseInt(offset));
-
-  const entries = db.prepare(query).all(...params);
-  const total   = db.prepare('SELECT COUNT(*) AS count FROM account_ledger').get().count;
-
-  res.json({ entries, total, balance: getBalance() });
-});
-
-// ── Manual deposit (GM) ──────────────────────────────────────────────────────
-router.post('/deposit', requireRole('gm'), (req, res) => {
-  const { amount, description, session_id } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
-  if (!description) return res.status(400).json({ error: 'description is required' });
-
-  const newBalance = postLedgerEntry({
-    type:        'deposit_manual',
-    amount,
-    description,
-    sessionId:   session_id ?? null,
-    createdBy:   req.user.id,
-  });
-
-  res.json({ ok: true, balance: newBalance });
-});
-
-// ── Mission payout deposit (GM) ──────────────────────────────────────────────
-router.post('/mission-payout', requireRole('gm'), (req, res) => {
-  const { amount, description, session_id } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
-
-  const newBalance = postLedgerEntry({
-    type:        'deposit_mission',
-    amount,
-    description: description ?? 'Mission payout',
-    sessionId:   session_id ?? null,
-    createdBy:   req.user.id,
-  });
-
-  res.json({ ok: true, balance: newBalance });
-});
-
-// ── Manual withdrawal (GM) ───────────────────────────────────────────────────
-router.post('/withdraw', requireRole('gm'), (req, res) => {
-  const { amount, description } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
-  if (!description) return res.status(400).json({ error: 'description is required' });
-
-  const balance = getBalance();
-  if (balance < amount) {
-    return res.status(400).json({ error: `Insufficient funds. Balance: ${balance}` });
-  }
-
-  const newBalance = postLedgerEntry({
-    type:      'withdraw_manual',
-    amount,
-    description,
-    createdBy: req.user.id,
-  });
-
-  res.json({ ok: true, balance: newBalance });
-});
-
-// ── Sell unit (QM/GM) ────────────────────────────────────────────────────────
-router.post('/sell-unit', requireMinRole('quartermaster'), (req, res) => {
-  const { unit_id, override_price } = req.body;
-  if (!unit_id) return res.status(400).json({ error: 'unit_id is required' });
-
-  const unit = db.prepare('SELECT * FROM units WHERE id = ?').get(unit_id);
-  if (!unit) return res.status(404).json({ error: 'Unit not found' });
-  if (unit.status === 'retired') return res.status(400).json({ error: 'Unit is already retired' });
-
-  const { saleValue, breakdown } = calcSaleValue(unit);
-  const finalPrice = override_price != null ? parseInt(override_price) : saleValue;
-
-  db.transaction(() => {
-    // Retire the unit
-    db.prepare(`UPDATE units SET status = 'retired' WHERE id = ?`).run(unit_id);
-
-    // Unassign any pilot
-    db.prepare(`
-      UPDATE pilot_unit_assignments SET unassigned_at = datetime('now')
-      WHERE unit_id = ? AND unassigned_at IS NULL
-    `).run(unit_id);
-
-    // Credit account
-    postLedgerEntry({
-      type:        'deposit_sale',
-      amount:      finalPrice,
-      description: `Sold unit: ${unit.name}${override_price != null ? ' (GM override price)' : ''}`,
-      unitId:      unit_id,
-      createdBy:   req.user.id,
-    });
-  })();
-
-  res.json({
-    ok:           true,
-    unit_id,
-    calculated_sale_value: saleValue,
-    final_price:  finalPrice,
-    balance:      getBalance(),
-    breakdown,
-  });
-});
-
-module.exports = { router, postLedgerEntry };

@@ -185,7 +185,7 @@ function countDamaged(arr) {
   return arr.filter(Boolean).length;
 }
 
-module.exports = {
+export {
   calcCostPerPip,
   calcRepairCost,
   calcFullRepairCost,

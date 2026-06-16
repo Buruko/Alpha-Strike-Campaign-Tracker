@@ -1,36 +1,23 @@
-/**
- * routes/notifications.js
- *
- * GET   /api/notifications          — unread + recent for current user
- * PATCH /api/notifications/:id/read — mark one read
- * POST  /api/notifications/read-all — mark all read
- */
+import { getDb } from '../db/db.js';
+import { verifyAuth } from '../middleware/auth.js';
+import { ok } from '../lib/response.js';
 
-const router = require('express').Router();
-const db = require('../db/db');
-const { verifyAuth } = require('../middleware/auth');
+export function notificationRoutes(router) {
 
-router.use(verifyAuth);
+  router.get('/api/notifications', verifyAuth, async (request, env) => {
+    const db = getDb(env);
+    return ok(await db.all('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50', [request.user.id]));
+  });
 
-router.get('/', (req, res) => {
-  const notifs = db.prepare(`
-    SELECT * FROM notifications
-    WHERE user_id = ?
-    ORDER BY created_at DESC
-    LIMIT 50
-  `).all(req.user.id);
-  res.json(notifs);
-});
+  router.patch('/api/notifications/:id/read', verifyAuth, async (request, env) => {
+    const db = getDb(env);
+    await db.run('UPDATE notifications SET read=1 WHERE id=? AND user_id=?', [request.params.id, request.user.id]);
+    return ok({ ok: true });
+  });
 
-router.patch('/:id/read', (req, res) => {
-  db.prepare('UPDATE notifications SET read = 1 WHERE id = ? AND user_id = ?')
-    .run(req.params.id, req.user.id);
-  res.json({ ok: true });
-});
-
-router.post('/read-all', (req, res) => {
-  db.prepare('UPDATE notifications SET read = 1 WHERE user_id = ?').run(req.user.id);
-  res.json({ ok: true });
-});
-
-module.exports = router;
+  router.post('/api/notifications/read-all', verifyAuth, async (request, env) => {
+    const db = getDb(env);
+    await db.run('UPDATE notifications SET read=1 WHERE user_id=?', [request.user.id]);
+    return ok({ ok: true });
+  });
+}

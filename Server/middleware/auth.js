@@ -1,31 +1,60 @@
 /**
- * auth.js middleware
- * Verifies JWT from httpOnly cookie or Authorization header.
- * Attaches decoded payload to req.user.
+ * auth.js  —  Workers-compatible JWT middleware
+ *
+ * Reads token from:
+ *   1. Cookie header  (name=token)
+ *   2. Authorization: Bearer <token>
+ *
+ * Attaches decoded payload to request.user.
+ * Returns 401 Response if missing/invalid.
  */
 
-const jwt = require('jsonwebtoken');
+import { error } from 'itty-router';
+import { verifyJwt } from '../lib/jwt.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
-
-function verifyAuth(req, res, next) {
-  // Try cookie first, then Authorization header
-  const token =
-    req.cookies?.token ||
-    (req.headers.authorization?.startsWith('Bearer ')
-      ? req.headers.authorization.slice(7)
-      : null);
-
-  if (!token) {
-    return res.status(401).json({ error: 'Authentication required' });
+export function parseCookies(cookieHeader) {
+  const out = {};
+  if (!cookieHeader) return out;
+  for (const part of cookieHeader.split(';')) {
+    const [k, ...v] = part.trim().split('=');
+    if (k) out[k.trim()] = decodeURIComponent(v.join('=').trim());
   }
-
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
+  return out;
 }
 
-module.exports = { verifyAuth, JWT_SECRET };
+export async function verifyAuth(request, env) {
+  const cookies = parseCookies(request.headers.get('cookie'));
+  const authHeader = request.headers.get('authorization') || '';
+  const token = cookies.token ||
+    (authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null);
+
+  if (!token) return error(401, 'Authentication required');
+
+  const payload = await verifyJwt(token, env.JWT_SECRET);
+  if (!payload) return error(401, 'Invalid or expired token');
+
+  request.user = payload;
+  // returning undefined lets itty-router continue to next handler
+}
+
+export function requireRole(...roles) {
+  return async (request, env) => {
+    const authResult = await verifyAuth(request, env);
+    if (authResult) return authResult; // error response
+    if (!roles.flat().includes(request.user.role)) {
+      return error(403, `Access denied. Required: ${roles.flat().join(' or ')}`);
+    }
+  };
+}
+
+export function requireMinRole(minRole) {
+  const levels = { player: 1, technician: 2, quartermaster: 3, gm: 4 };
+  const min = levels[minRole] ?? 1;
+  return async (request, env) => {
+    const authResult = await verifyAuth(request, env);
+    if (authResult) return authResult;
+    if ((levels[request.user.role] ?? 0) < min) {
+      return error(403, `Minimum role required: ${minRole}`);
+    }
+  };
+}

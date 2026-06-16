@@ -87,7 +87,7 @@ const DAMAGE_XP = {
   damage_melee:    1,
 };
 
-module.exports = {
+export {
   calcKillXP,
   getDisparityMultiplier,
   DAMAGE_XP,

@@ -128,7 +128,7 @@ function buildRankUpNotification(pilot, rankDef, userId) {
   };
 }
 
-module.exports = {
+export {
   RANK_TABLE,
   MAX_RANK,
   getRankDef,

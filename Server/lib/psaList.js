@@ -134,4 +134,4 @@ const PSA_LIST = [
   },
 ];
 
-module.exports = { PSA_LIST };
+export { PSA_LIST };

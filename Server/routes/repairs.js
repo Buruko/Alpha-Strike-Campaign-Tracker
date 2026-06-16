@@ -1,251 +1,90 @@
-/**
- * routes/repairs.js
- *
- * GET    /api/repairs                — list repair jobs (filtered by role)
- * GET    /api/repairs/:id            — repair job detail
- * POST   /api/repairs                — technician/GM creates repair job
- * PATCH  /api/repairs/:id/approve    — GM/QM approves repair job
- * PATCH  /api/repairs/:id/complete   — technician/GM completes repair, applies to unit, debits account
- * PATCH  /api/repairs/:id/cancel     — GM cancels repair job
- */
+import { v4 as uuid } from 'uuid';
+import { getDb } from '../db/db.js';
+import { verifyAuth, requireMinRole } from '../middleware/auth.js';
+import { ok, err } from '../lib/response.js';
+import { calcCostPerPip } from '../lib/repairCalculator.js';
+import { postLedger } from './units.js';
 
-const router = require('express').Router();
-const { v4: uuid } = require('uuid');
-const db = require('../db/db');
-const { verifyAuth } = require('../middleware/auth');
-const { requireMinRole, requireRole } = require('../middleware/requireRole');
-const { calcRepairCost, calcCostPerPip } = require('../lib/repairCalculator');
+export function repairRoutes(router) {
 
-router.use(verifyAuth);
+  router.get('/api/repairs', verifyAuth, async (request, env) => {
+    const db = getDb(env);
+    const { role, player_id } = request.user;
+    const jobs = role === 'player'
+      ? await db.all(`SELECT rj.*,u.name AS unit_name,pl.callsign AS player_callsign FROM repair_jobs rj JOIN units u ON u.id=rj.unit_id JOIN players pl ON pl.id=u.player_id WHERE pl.id=? ORDER BY rj.created_at DESC`, [player_id])
+      : await db.all(`SELECT rj.*,u.name AS unit_name,pl.callsign AS player_callsign,tech.username AS tech_username FROM repair_jobs rj JOIN units u ON u.id=rj.unit_id JOIN players pl ON pl.id=u.player_id LEFT JOIN users tech ON tech.id=rj.technician_user_id ORDER BY rj.created_at DESC`);
+    return ok(jobs);
+  });
 
-function getAccountBalance() {
-  return db.prepare('SELECT balance FROM campaign_account WHERE id = 1').get()?.balance ?? 0;
+  router.get('/api/repairs/:id', verifyAuth, async (request, env) => {
+    const db  = getDb(env);
+    const job = await db.get(`SELECT rj.*,u.name AS unit_name,u.base_pv,u.armor_max,pl.callsign AS player_callsign,pl.id AS player_id,tech.username AS tech_username FROM repair_jobs rj JOIN units u ON u.id=rj.unit_id JOIN players pl ON pl.id=u.player_id LEFT JOIN users tech ON tech.id=rj.technician_user_id WHERE rj.id=?`, [request.params.id]);
+    if (!job) return err('Repair job not found', 404);
+    const { role, player_id } = request.user;
+    if (role === 'player' && job.player_id !== player_id) return err('Access denied', 403);
+    return ok(job);
+  });
+
+  router.post('/api/repairs', requireMinRole('technician'), async (request, env) => {
+    const db   = getDb(env);
+    const body = await request.json().catch(() => ({}));
+    const { unit_id, armor_restored, structure_restored, engine_restored, fcu_restored, mp_restored, weapon_restored, notes } = body;
+    if (!unit_id) return err('unit_id required', 400);
+    const unit = await db.get('SELECT * FROM units WHERE id=?', [unit_id]);
+    if (!unit) return err('Unit not found', 404);
+    const r = { armor: parseInt(armor_restored??0), structure: parseInt(structure_restored??0), engine: parseInt(engine_restored??0), fcu: parseInt(fcu_restored??0), mp: parseInt(mp_restored??0), weapon: parseInt(weapon_restored??0) };
+    const errs = [];
+    if (r.armor     > unit.armor_dmg)     errs.push(`armor_restored (${r.armor}) exceeds damage`);
+    if (r.structure > unit.structure_dmg) errs.push(`structure_restored (${r.structure}) exceeds damage`);
+    if (r.engine    > unit.engine_dmg)    errs.push(`engine_restored (${r.engine}) exceeds damage`);
+    if (r.fcu       > unit.fcu_dmg)       errs.push(`fcu_restored (${r.fcu}) exceeds damage`);
+    if (r.mp        > unit.mp_dmg)        errs.push(`mp_restored (${r.mp}) exceeds damage`);
+    if (r.weapon    > unit.weapon_dmg)    errs.push(`weapon_restored (${r.weapon}) exceeds damage`);
+    if (errs.length) return err(errs.join('; '), 400);
+    const cpp  = calcCostPerPip(unit.base_pv, unit.armor_max);
+    const cost = (r.armor*cpp.armor)+(r.structure*cpp.structure)+(r.engine*cpp.engine)+(r.fcu*cpp.fcu)+(r.mp*cpp.mp)+(r.weapon*cpp.weapon);
+    const id   = uuid();
+    await db.run(`INSERT INTO repair_jobs (id,unit_id,technician_user_id,armor_restored,structure_restored,engine_restored,fcu_restored,mp_restored,weapon_restored,repair_cost,notes,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending')`,
+      [id,unit_id,request.user.id,r.armor,r.structure,r.engine,r.fcu,r.mp,r.weapon,cost,notes??null]);
+    return ok(await db.get('SELECT * FROM repair_jobs WHERE id=?', [id]), 201);
+  });
+
+  router.patch('/api/repairs/:id/approve', requireMinRole('quartermaster'), async (request, env) => {
+    const db  = getDb(env);
+    const job = await db.get('SELECT * FROM repair_jobs WHERE id=?', [request.params.id]);
+    if (!job) return err('Repair job not found', 404);
+    if (job.status !== 'pending') return err(`Cannot approve status: ${job.status}`, 400);
+    const acct = await db.get('SELECT balance FROM campaign_account WHERE id=1');
+    if ((acct?.balance ?? 0) < job.repair_cost) return err(`Insufficient funds. Balance: ${acct?.balance ?? 0}, Cost: ${job.repair_cost}`, 400);
+    await db.run('UPDATE repair_jobs SET status=?,approved_by=? WHERE id=?', ['approved', request.user.id, job.id]);
+    return ok(await db.get('SELECT * FROM repair_jobs WHERE id=?', [job.id]));
+  });
+
+  router.patch('/api/repairs/:id/complete', requireMinRole('technician'), async (request, env) => {
+    const db  = getDb(env);
+    const job = await db.get('SELECT * FROM repair_jobs WHERE id=?', [request.params.id]);
+    if (!job) return err('Repair job not found', 404);
+    if (job.status !== 'approved') return err(`Job must be approved first. Status: ${job.status}`, 400);
+    const unit = await db.get('SELECT * FROM units WHERE id=?', [job.unit_id]);
+    if (!unit) return err('Unit not found', 404);
+    await db.batch([
+      { sql: `UPDATE units SET armor_dmg=MAX(0,armor_dmg-?),structure_dmg=MAX(0,structure_dmg-?),engine_dmg=MAX(0,engine_dmg-?),fcu_dmg=MAX(0,fcu_dmg-?),mp_dmg=MAX(0,mp_dmg-?),weapon_dmg=MAX(0,weapon_dmg-?) WHERE id=?`,
+        params: [job.armor_restored,job.structure_restored,job.engine_restored,job.fcu_restored,job.mp_restored,job.weapon_restored,unit.id] },
+      { sql: "UPDATE repair_jobs SET status='complete',completed_at=datetime('now') WHERE id=?", params: [job.id] },
+    ]);
+    await postLedger(db, { type:'withdraw_repair', amount:job.repair_cost, description:`Repair: ${unit.name}`, unitId:unit.id, repairJobId:job.id, createdBy:request.user.id });
+    const owner = await db.get(`SELECT u.id FROM users u JOIN players pl ON pl.user_id=u.id WHERE pl.id=?`, [unit.player_id]);
+    if (owner) await db.run('INSERT INTO notifications (id,user_id,type,title,body) VALUES (?,?,?,?,?)',
+      [uuid(), owner.id, 'repair_complete', `${unit.name} repairs complete`, `Cost: ${job.repair_cost} pts deducted.`]);
+    return ok(await db.get('SELECT * FROM repair_jobs WHERE id=?', [job.id]));
+  });
+
+  router.patch('/api/repairs/:id/cancel', requireMinRole('gm'), async (request, env) => {
+    const db  = getDb(env);
+    const job = await db.get('SELECT id,status FROM repair_jobs WHERE id=?', [request.params.id]);
+    if (!job) return err('Repair job not found', 404);
+    if (job.status === 'complete') return err('Cannot cancel a completed job', 400);
+    await db.run("UPDATE repair_jobs SET status='cancelled' WHERE id=?", [job.id]);
+    return ok({ ok: true });
+  });
 }
-
-function postLedger({ type, amount, balanceAfter, description, unitId, repairJobId, createdBy }) {
-  db.prepare(`
-    INSERT INTO account_ledger
-      (id, type, amount, balance_after, description, unit_id, repair_job_id, created_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(uuid(), type, amount, balanceAfter, description, unitId ?? null, repairJobId ?? null, createdBy);
-}
-
-// ── List repair jobs ─────────────────────────────────────────────────────────
-router.get('/', (req, res) => {
-  const { role, player_id } = req.user;
-
-  let jobs;
-  if (role === 'player') {
-    jobs = db.prepare(`
-      SELECT rj.*, u.name AS unit_name, pl.callsign AS player_callsign
-      FROM repair_jobs rj
-      JOIN units u ON u.id = rj.unit_id
-      JOIN players pl ON pl.id = u.player_id
-      WHERE pl.id = ?
-      ORDER BY rj.created_at DESC
-    `).all(player_id);
-  } else {
-    jobs = db.prepare(`
-      SELECT rj.*, u.name AS unit_name, pl.callsign AS player_callsign,
-             tech.username AS tech_username
-      FROM repair_jobs rj
-      JOIN units u ON u.id = rj.unit_id
-      JOIN players pl ON pl.id = u.player_id
-      LEFT JOIN users tech ON tech.id = rj.technician_user_id
-      ORDER BY rj.created_at DESC
-    `).all();
-  }
-
-  res.json(jobs);
-});
-
-// ── Get repair job detail ─────────────────────────────────────────────────────
-router.get('/:id', (req, res) => {
-  const job = db.prepare(`
-    SELECT rj.*, u.name AS unit_name, u.base_pv, u.armor_max,
-           pl.callsign AS player_callsign, pl.id AS player_id,
-           tech.username AS tech_username
-    FROM repair_jobs rj
-    JOIN units u ON u.id = rj.unit_id
-    JOIN players pl ON pl.id = u.player_id
-    LEFT JOIN users tech ON tech.id = rj.technician_user_id
-    WHERE rj.id = ?
-  `).get(req.params.id);
-
-  if (!job) return res.status(404).json({ error: 'Repair job not found' });
-
-  const { role, player_id } = req.user;
-  if (role === 'player' && job.player_id !== player_id) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-
-  res.json(job);
-});
-
-// ── Create repair job ────────────────────────────────────────────────────────
-router.post('/', requireMinRole('technician'), (req, res) => {
-  const {
-    unit_id,
-    armor_restored, structure_restored, engine_restored,
-    fcu_restored, mp_restored, weapon_restored,
-    notes,
-  } = req.body;
-
-  if (!unit_id) return res.status(400).json({ error: 'unit_id is required' });
-
-  const unit = db.prepare('SELECT * FROM units WHERE id = ?').get(unit_id);
-  if (!unit) return res.status(404).json({ error: 'Unit not found' });
-
-  // Validate repair amounts don't exceed current damage
-  const repairs = {
-    armor:     parseInt(armor_restored     ?? 0),
-    structure: parseInt(structure_restored ?? 0),
-    engine:    parseInt(engine_restored    ?? 0),
-    fcu:       parseInt(fcu_restored       ?? 0),
-    mp:        parseInt(mp_restored        ?? 0),
-    weapon:    parseInt(weapon_restored    ?? 0),
-  };
-
-  const errors = [];
-  if (repairs.armor     > unit.armor_dmg)     errors.push(`armor_restored (${repairs.armor}) exceeds damage (${unit.armor_dmg})`);
-  if (repairs.structure > unit.structure_dmg) errors.push(`structure_restored (${repairs.structure}) exceeds damage (${unit.structure_dmg})`);
-  if (repairs.engine    > unit.engine_dmg)    errors.push(`engine_restored (${repairs.engine}) exceeds damage (${unit.engine_dmg})`);
-  if (repairs.fcu       > unit.fcu_dmg)       errors.push(`fcu_restored (${repairs.fcu}) exceeds damage (${unit.fcu_dmg})`);
-  if (repairs.mp        > unit.mp_dmg)        errors.push(`mp_restored (${repairs.mp}) exceeds damage (${unit.mp_dmg})`);
-  if (repairs.weapon    > unit.weapon_dmg)    errors.push(`weapon_restored (${repairs.weapon}) exceeds damage (${unit.weapon_dmg})`);
-  if (errors.length) return res.status(400).json({ error: errors.join('; ') });
-
-  // Calculate repair cost for this specific job
-  const cpp = calcCostPerPip(unit.base_pv, unit.armor_max);
-  const repairCost =
-    (repairs.armor     * cpp.armor)     +
-    (repairs.structure * cpp.structure) +
-    (repairs.engine    * cpp.engine)    +
-    (repairs.fcu       * cpp.fcu)       +
-    (repairs.mp        * cpp.mp)        +
-    (repairs.weapon    * cpp.weapon);
-
-  const id = uuid();
-  db.prepare(`
-    INSERT INTO repair_jobs (
-      id, unit_id, technician_user_id,
-      armor_restored, structure_restored, engine_restored,
-      fcu_restored, mp_restored, weapon_restored,
-      repair_cost, notes, status
-    ) VALUES (
-      ?, ?, ?,
-      ?, ?, ?,
-      ?, ?, ?,
-      ?, ?, 'pending'
-    )
-  `).run(
-    id, unit_id, req.user.id,
-    repairs.armor, repairs.structure, repairs.engine,
-    repairs.fcu, repairs.mp, repairs.weapon,
-    repairCost, notes ?? null
-  );
-
-  const job = db.prepare('SELECT * FROM repair_jobs WHERE id = ?').get(id);
-  res.status(201).json(job);
-});
-
-// ── Approve repair job (QM / GM) ─────────────────────────────────────────────
-router.patch('/:id/approve', requireMinRole('quartermaster'), (req, res) => {
-  const job = db.prepare('SELECT * FROM repair_jobs WHERE id = ?').get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Repair job not found' });
-  if (job.status !== 'pending') {
-    return res.status(400).json({ error: `Cannot approve a job with status: ${job.status}` });
-  }
-
-  const balance = getAccountBalance();
-  if (balance < job.repair_cost) {
-    return res.status(400).json({
-      error: `Insufficient funds. Balance: ${balance}, Repair cost: ${job.repair_cost}`,
-    });
-  }
-
-  db.prepare(`
-    UPDATE repair_jobs SET status = 'approved', approved_by = ? WHERE id = ?
-  `).run(req.user.id, job.id);
-
-  res.json(db.prepare('SELECT * FROM repair_jobs WHERE id = ?').get(job.id));
-});
-
-// ── Complete repair job ───────────────────────────────────────────────────────
-router.patch('/:id/complete', requireMinRole('technician'), (req, res) => {
-  const job = db.prepare('SELECT * FROM repair_jobs WHERE id = ?').get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Repair job not found' });
-  if (job.status !== 'approved') {
-    return res.status(400).json({ error: `Job must be approved before completing. Status: ${job.status}` });
-  }
-
-  const unit = db.prepare('SELECT * FROM units WHERE id = ?').get(job.unit_id);
-  if (!unit) return res.status(404).json({ error: 'Unit not found' });
-
-  db.transaction(() => {
-    // Apply repairs to unit
-    db.prepare(`
-      UPDATE units SET
-        armor_dmg     = MAX(0, armor_dmg     - ?),
-        structure_dmg = MAX(0, structure_dmg - ?),
-        engine_dmg    = MAX(0, engine_dmg    - ?),
-        fcu_dmg       = MAX(0, fcu_dmg       - ?),
-        mp_dmg        = MAX(0, mp_dmg        - ?),
-        weapon_dmg    = MAX(0, weapon_dmg    - ?)
-      WHERE id = ?
-    `).run(
-      job.armor_restored, job.structure_restored, job.engine_restored,
-      job.fcu_restored, job.mp_restored, job.weapon_restored,
-      unit.id
-    );
-
-    // Debit campaign account
-    const balance    = getAccountBalance();
-    const newBalance = balance - job.repair_cost;
-    db.prepare('UPDATE campaign_account SET balance = ? WHERE id = 1').run(newBalance);
-    postLedger({
-      type:         'withdraw_repair',
-      amount:       job.repair_cost,
-      balanceAfter: newBalance,
-      description:  `Repair: ${unit.name}`,
-      unitId:       unit.id,
-      repairJobId:  job.id,
-      createdBy:    req.user.id,
-    });
-
-    // Mark job complete
-    db.prepare(`
-      UPDATE repair_jobs SET status = 'complete', completed_at = datetime('now') WHERE id = ?
-    `).run(job.id);
-
-    // Create notification for unit owner
-    const owner = db.prepare(`
-      SELECT u.id FROM users u JOIN players pl ON pl.user_id = u.id WHERE pl.id = ?
-    `).get(unit.player_id);
-    if (owner) {
-      db.prepare(`
-        INSERT INTO notifications (id, user_id, type, title, body)
-        VALUES (?, ?, 'repair_complete', ?, ?)
-      `).run(
-        uuid(), owner.id,
-        `${unit.name} repairs complete`,
-        `Repair job finished. Cost: ${job.repair_cost} pts deducted from campaign account.`
-      );
-    }
-  })();
-
-  res.json(db.prepare('SELECT * FROM repair_jobs WHERE id = ?').get(job.id));
-});
-
-// ── Cancel repair job (GM only) ──────────────────────────────────────────────
-router.patch('/:id/cancel', requireRole('gm'), (req, res) => {
-  const job = db.prepare('SELECT * FROM repair_jobs WHERE id = ?').get(req.params.id);
-  if (!job) return res.status(404).json({ error: 'Repair job not found' });
-  if (job.status === 'complete') {
-    return res.status(400).json({ error: 'Cannot cancel a completed repair job' });
-  }
-  db.prepare(`UPDATE repair_jobs SET status = 'cancelled' WHERE id = ?`).run(job.id);
-  res.json({ ok: true });
-});
-
-module.exports = router;

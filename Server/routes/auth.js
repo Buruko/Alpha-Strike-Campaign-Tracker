@@ -1,131 +1,72 @@
-/**
- * routes/auth.js
- * POST /api/auth/login
- * POST /api/auth/logout
- * POST /api/auth/register   (GM only)
- * GET  /api/auth/me
- */
+import { error } from 'itty-router';
+import bcrypt from 'bcryptjs';
+import { v4 as uuid } from 'uuid';
+import { getDb } from '../db/db.js';
+import { signJwt } from '../lib/jwt.js';
+import { verifyAuth } from '../middleware/auth.js';
+import { ok, err, okWithCookie, clearCookie } from '../lib/response.js';
 
-const router  = require('express').Router();
-const bcrypt  = require('bcryptjs');
-const jwt     = require('jsonwebtoken');
-const { v4: uuid } = require('uuid');
-const db      = require('../db/db');
-const { verifyAuth, JWT_SECRET } = require('../middleware/auth');
-const { requireRole } = require('../middleware/requireRole');
+const isProd = (env) => env.ENVIRONMENT === 'production';
 
-const COOKIE_OPTS = {
-  httpOnly: true,
-  secure:   process.env.NODE_ENV === 'production',
-  sameSite: 'lax',
-  maxAge:   7 * 24 * 60 * 60 * 1000, // 7 days
-};
+export function authRoutes(router) {
 
-// ── Login ────────────────────────────────────────────────────────────────────
-router.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password required' });
-  }
+  // POST /api/auth/login
+  router.post('/api/auth/login', async (request, env) => {
+    const { username, password } = await request.json().catch(() => ({}));
+    if (!username || !password) return err('Username and password required', 400);
+    const db = getDb(env);
+    const user = await db.get('SELECT * FROM users WHERE username = ?', [username]);
+    if (!user || !bcrypt.compareSync(password, user.password_hash))
+      return err('Invalid username or password', 401);
+    const player = await db.get('SELECT id FROM players WHERE user_id = ?', [user.id]);
+    const payload = { id: user.id, username: user.username, role: user.role, player_id: player?.id ?? null };
+    const token = await signJwt(payload, env.JWT_SECRET);
+    return okWithCookie({ user: payload }, 'token', token, isProd(env));
+  });
 
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-    return res.status(401).json({ error: 'Invalid username or password' });
-  }
+  // POST /api/auth/logout
+  router.post('/api/auth/logout', () => clearCookie('token'));
 
-  // Attach player_id if this user has a player record
-  const player = db.prepare('SELECT id FROM players WHERE user_id = ?').get(user.id);
+  // GET /api/auth/me
+  router.get('/api/auth/me', verifyAuth, async (request, env) => {
+    const db = getDb(env);
+    const user = await db.get('SELECT id,username,role,created_at FROM users WHERE id = ?', [request.user.id]);
+    if (!user) return err('User not found', 404);
+    const player = await db.get('SELECT * FROM players WHERE user_id = ?', [user.id]);
+    return ok({ user, player: player ?? null });
+  });
 
-  const payload = {
-    id:        user.id,
-    username:  user.username,
-    role:      user.role,
-    player_id: player?.id ?? null,
-  };
-
-  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
-  res.cookie('token', token, COOKIE_OPTS);
-  res.json({ user: payload });
-});
-
-// ── Logout ───────────────────────────────────────────────────────────────────
-router.post('/logout', (req, res) => {
-  res.clearCookie('token');
-  res.json({ ok: true });
-});
-
-// ── Me ───────────────────────────────────────────────────────────────────────
-router.get('/me', verifyAuth, (req, res) => {
-  const user = db.prepare(
-    'SELECT id, username, role, created_at FROM users WHERE id = ?'
-  ).get(req.user.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-
-  const player = db.prepare('SELECT * FROM players WHERE user_id = ?').get(user.id);
-  res.json({ user, player: player ?? null });
-});
-
-// ── Register (GM only) ───────────────────────────────────────────────────────
-router.post('/register', verifyAuth, requireRole('gm'), (req, res) => {
-  const { username, password, role, callsign } = req.body;
-
-  if (!username || !password || !role) {
-    return res.status(400).json({ error: 'username, password, and role are required' });
-  }
-  const validRoles = ['player', 'technician', 'quartermaster', 'gm'];
-  if (!validRoles.includes(role)) {
-    return res.status(400).json({ error: `role must be one of: ${validRoles.join(', ')}` });
-  }
-
-  const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-  if (existing) return res.status(409).json({ error: 'Username already taken' });
-
-  const hash   = bcrypt.hashSync(password, 10);
-  const userId = uuid();
-
-  const createUser = db.transaction(() => {
-    db.prepare(`
-      INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)
-    `).run(userId, username, hash, role);
-
-    // Auto-create player record for player role
+  // POST /api/auth/register  (GM only)
+  router.post('/api/auth/register', verifyAuth, async (request, env) => {
+    if (request.user.role !== 'gm') return err('GM only', 403);
+    const { username, password, role, callsign } = await request.json().catch(() => ({}));
+    if (!username || !password || !role) return err('username, password, role required', 400);
+    const valid = ['player','technician','quartermaster','gm'];
+    if (!valid.includes(role)) return err(`role must be one of: ${valid.join(', ')}`, 400);
+    const db = getDb(env);
+    const existing = await db.get('SELECT id FROM users WHERE username = ?', [username]);
+    if (existing) return err('Username already taken', 409);
+    const hash   = bcrypt.hashSync(password, 10);
+    const userId = uuid();
+    const stmts  = [{ sql: 'INSERT INTO users (id,username,password_hash,role) VALUES (?,?,?,?)', params: [userId, username, hash, role] }];
+    let playerId = null;
     if (role === 'player') {
-      const playerId = uuid();
-      db.prepare(`
-        INSERT INTO players (id, user_id, callsign) VALUES (?, ?, ?)
-      `).run(playerId, userId, callsign || username);
-      return { userId, playerId };
+      playerId = uuid();
+      stmts.push({ sql: 'INSERT INTO players (id,user_id,callsign) VALUES (?,?,?)', params: [playerId, userId, callsign || username] });
     }
-    return { userId, playerId: null };
+    await db.batch(stmts);
+    return ok({ message: 'User created', userId, playerId }, 201);
   });
 
-  const result = createUser();
-  res.status(201).json({
-    message: 'User created',
-    userId:  result.userId,
-    playerId: result.playerId,
+  // POST /api/auth/change-password
+  router.post('/api/auth/change-password', verifyAuth, async (request, env) => {
+    const { currentPassword, newPassword } = await request.json().catch(() => ({}));
+    if (!currentPassword || !newPassword) return err('currentPassword and newPassword required', 400);
+    if (newPassword.length < 8) return err('New password must be at least 8 characters', 400);
+    const db   = getDb(env);
+    const user = await db.get('SELECT * FROM users WHERE id = ?', [request.user.id]);
+    if (!bcrypt.compareSync(currentPassword, user.password_hash)) return err('Current password incorrect', 401);
+    await db.run('UPDATE users SET password_hash = ? WHERE id = ?', [bcrypt.hashSync(newPassword, 10), request.user.id]);
+    return ok({ ok: true });
   });
-});
-
-// ── Change password ──────────────────────────────────────────────────────────
-router.post('/change-password', verifyAuth, (req, res) => {
-  const { currentPassword, newPassword } = req.body;
-  if (!currentPassword || !newPassword) {
-    return res.status(400).json({ error: 'currentPassword and newPassword required' });
-  }
-  if (newPassword.length < 8) {
-    return res.status(400).json({ error: 'New password must be at least 8 characters' });
-  }
-
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
-  if (!bcrypt.compareSync(currentPassword, user.password_hash)) {
-    return res.status(401).json({ error: 'Current password is incorrect' });
-  }
-
-  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?')
-    .run(bcrypt.hashSync(newPassword, 10), req.user.id);
-
-  res.json({ ok: true });
-});
-
-module.exports = router;
+}
